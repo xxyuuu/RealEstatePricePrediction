@@ -1,0 +1,486 @@
+---
+title: "521 - Final Project"
+author: "Team Potato"
+date: "April 28, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+library(dplyr)
+library(corrplot)
+library(knitr)
+library(purrr)
+library(randomForest)
+library(gbm)
+library(glmnet)
+library(caret)
+set.seed(521)
+load('ames_train.Rdata')
+load('ames_test.Rdata')
+load('ames_validation.Rdata')
+```
+
+### 1. Introduction
+
+We are given a dataset of house prices from Ames, Iowa. We are tasked with indentifying house prices that are over or undervalued. We approached this problem by trying various models in an attempt to predict house prices accuractly, quantify varience, and identify top features that might impact prices. 
+
+### 2. Exploratory Data Analysis
+
+**Skew of Response**
+
+We are interested in predicting house price given a slew of of other variables. First we investigated the response variable and found that it was signifcantly right-skewed. A log transform would center the data better. 
+
+```{r, echo=FALSE}
+par(mfrow = c(1, 2))
+plot(density(ames_train$price), main = 'House Selling Price')
+plot(density(log(ames_train$price)), main = 'Log Selling Price')
+```
+
+
+**Correlation**
+
+Next we looked at the pairwise correlation between all the numeric features (without `PID` and without missing values). 
+
+```{r, echo=FALSE}
+k = sapply(ames_train, function(x) is.numeric(x) & !any(is.na(x)))
+ames_train_subset = ames_train[,k] %>% select(-PID)
+corrplot(cor(ames_train_subset), method="color")
+```
+
+We see that there are `r length(k) - 1` numeric variables and several are strongly correlated with price: `area`, `Overall.Qual`, and `Total.SQ`. Some variables are highly correlated with each other like `Garage.Cars` and `Garage.Area`, which makes sense. This gives us an idea of which variables might be important. 
+
+**Numeric Variables**
+
+Now we investigate the numeric data. 
+
+```{r, echo=FALSE}
+par(mfrow = c(3,4))
+count = 0
+for (i in which(k)[-1]) {
+    plot(density(ames_train[[i]]), main = names(ames_train)[i] , xlab = '')
+}
+```
+
+Some of the numeric factors are very skewed. Some have patterns that make it look like the it has bins (is a factor in disguise). Some the variables are like `Kitchen.Qual` are very bimodal.
+
+The exploratory data analysis tells us that variable selection and transformation might be fruitful. 
+
+
+### 3. Data Cleaning
+
+The data, as it was provided, is very messy. Below we have documentented our changes to the data in the data cleaning steps. 
+
+```{r, echo=FALSE}
+data = list(ames_train,ames_test,ames_validation)
+nomiss = list()
+newvar = c("Heating.QC","Kitchen.Qual","Garage.Qual","Garage.Cond")
+for( j in seq_len(3)) {
+  df = data[j] %>% as.data.frame()
+  df = select(df, -Condition.2, -Electrical, -Lot.Frontage)
+  
+  is.na(df) <- df == ""
+  
+  # missing data
+  missing <- sort(map_dbl(df, function(x) sum(is.na(x)) / nrow(df)), decreasing = TRUE)
+
+  mis = missing[1:sum(missing > 0)]
+  
+  num = NULL
+  for (i in names(mis)) {
+    if (is.numeric(df[[i]])) {
+      num = c(num,i)
+    }
+  }
+  
+  for (i in num) {
+    df[[i]][is.na(df[[i]])] = 0
+  }
+  
+  for (i in newvar){
+    df[[i]] <- as.character(df[[i]])
+    df[[i]][df[[i]]=="Ex"] <- 5
+    df[[i]][df[[i]]=="Gd"] <- 4
+    df[[i]][df[[i]]=="TA"] <- 3
+    df[[i]][df[[i]]=="Fa"] <- 2
+    df[[i]][df[[i]]=="Po"] <- 1
+    df[[i]][is.na(df[[i]])] <- 0
+    df[[i]] <- as.numeric(df[[i]])
+  }
+  
+  int <- sapply(df, is.integer ) %>% which()
+  for (i in int){
+    df[[i]] <- as.numeric(df[[i]])
+  }
+  
+  nomiss[[j]] <- df
+  remove(df)
+}
+
+ames_train = nomiss[1] %>% as.data.frame()
+ames_test = nomiss[2] %>% as.data.frame()
+ames_validation = nomiss[3] %>% as.data.frame()
+
+df = rbind(ames_train,ames_test,ames_validation)
+missing <- sort(map_dbl(df, function(x) sum(is.na(x)) / nrow(df)), decreasing = TRUE)
+mis = missing[1:sum(missing > 0)]
+fac = NULL
+for (i in names(mis)) {
+  if (is.factor(df[[i]])) {
+    fac = c(fac,i)
+  }
+}
+
+for (i in fac) {
+  df[[i]] = as.character(df[[i]])
+  df[[i]][is.na(df[[i]])] <- "No"
+  df[[i]] = as.factor(df[[i]])
+}
+ames_train = df[seq_len(nrow(ames_train)),]
+ames_test = df[nrow(ames_train)+seq_len(nrow(ames_test)),]
+ames_validation = df[nrow(ames_train)+nrow(ames_test)+seq_len(nrow(ames_validation)),]
+
+```
+
+**Missing Data**
+
+Because we saw that there are many variables with missing values, we tried handling these. After checking the data set codebook, we set all the missing factor data as a new `No` level, and all the missing numeric data as 0. Take the training data as an example: since `Bsmt.Full.Bath` and `Bsmt.Half.Bath` both have missing rate less than 1%, and they have values of 0, 1 or 2. So we just replace the NA with 0; For `Mas.Vnr.Area`, we refer to the variable `Mas.Vnr.Type` and found that it contains values of `None` and `NA`, and for each NA value of `Mas.Vnr.Type`, `Mas.Vnr.Area` equals NA too. So we decide to bound them in regression function as interation, and so here we replace NAs with 0; For `Garage.Yr.Blt`, we decide to bound it with `Garage.Type` as interation in regression. So here we just treat NAs to be 0; For `Lot.Frontage`, since we have the variable `Lot.Area`, which contains the information of `Lot.Frontage`, so we deicide not to include this variable in the regression function.
+
+
+**Modifing Variables**
+
+The fact that some variables in test data contain new levels makes it difficult for us to predict. Therefore, our idea is to change their factor levels into numeric ones. Specifically, for `Heating.QC`,`Kitchen.Qual`,`Garage.Qual`,`Garage.Cond`, we change their factor levels as follows:
+
+```{r, echo=FALSE}
+kable(
+    data.frame(
+        numeric = c(5,4,3,2,1,0),
+        level = c('Ex', 'Gd', 'TA', 'Fa', 'Po', 'NA'),
+        condition = c('Excellent', 'Good', 'Typical/Average', 
+                      'Fair', 'Poor', 'No Garage')
+    )
+)
+```
+
+**Dropping Variables**
+
+Because some variables had observations in the testing set that aren't in the training set (which creates some issues with certain models) or variables were found to be redundant, some variables were dropped. This includes `Condition.2`, `Electrical`, and `Lot.Frontage`.
+
+
+### 4. Initial Model
+
+Going by what we have seen in the exploratory data analysis, we tried a linear regression model with a subset of predictors that are correlated with price. We also take the log of the selling price. 
+
+```{r}
+ames_train_subset2 = select(ames_train, 
+                           price, area, Lot.Area, Overall.Qual, Overall.Cond,
+                           Full.Bath, Enclosed.Porch, TotRms.AbvGrd,Garage.Area)
+model.simple = lm(log(price) ~ ., ames_train_subset2)
+```
+
+This gives us a adjusted R2 of 0.82, which is reasonable given this very simple model.
+
+We aren't limited by just these variables though. Looking at all the numeric variables (without missing values), there are `r sum(k) - 2` of them. But we think that many of the variables will be neglible in impact. Therefore we used stepwise selection to obtain a best linear model. Since our model should include no more than 20 variables (for interpretability), here we choose backwards selection with BIC as model selection criteria.
+
+```{r}
+model.simple2 <- lm(log(price)~., ames_train_subset)
+n = nrow(ames_train_subset)
+model1.bic <- step(model.simple2, k = log(n), trace = 0) # model selection (BIC)
+```
+
+```{r, echo=FALSE}
+kable(data.frame(coefficients(model1.bic)))
+```
+
+Our best BIC model has `r length(coefficients(model1.bic)) - 1` predictors and has adjusted R2 of 0.92. Some important vairables not included in our first model is `Bsmt.SF.1`, `Fireplaces`, and `Yr.Sold`. When we look at the coefficients, most of them are small compared to the intercept. Selling price increases with quality and condition of the house. Price seems to decrease the older a house is, but also increases with a more recent remodeling.  
+
+There is a concern of redundancy. For example, `Year.Built` and `Year.Remod.Add` seem to be correlated. Therefore, we use correlation plot to take a brief view. 
+
+```{r, echo=FALSE}
+data.bic <- ames_train[,names(model1.bic$model)[-1]] %>% select_if(is.numeric)
+M <- cor(data.bic)
+corrplot(M, method="color")
+```
+
+There does appear to be some correlated variables such as `BsmtFin.SF.1` and `BsmtFin.SF.2`. This gives us ideas for future feature engineering. 
+
+Now we will investigate the residuals plots to look at any issues with model fit / outliers. 
+
+```{r, echo=FALSE}
+plot(model1.bic)
+```
+
+The residuals vs fitted values plot tells us that for the most part the residuals are normally distributed and have constant varience. The normal QQ plot shows some values very far from normal (house 584, 462, and 183). From the leverge plot, it doesn't appear that these values are too influential. 
+
+```{r, echo=FALSE}
+RMSE = function(y,y_hat){
+  sqrt(mean((y-y_hat)^2))
+}
+
+rmse.bic = RMSE(ames_train$price,exp(model1.bic$fitted.values))
+# prediction
+Yhat.simple = predict(model1.bic, newdata=ames_test, interval = "pred") %>% as.data.frame()
+# coverage
+cov.bic = mean(log(ames_test$price) >= Yhat.simple$lwr & log(ames_test$price) <= Yhat.simple$upr)
+```
+
+Now we make predictions on the test data. The RMSE on the best linear model chosen with BIC is $`r round(rmse.bic)`$ and the coverage is `r cov.bic`. 
+
+
+### 5. Final Model
+
+We tried several models to find out important variables and interactions.
+
+#### 5.1 Boosting
+
+Because we think that the log price might not linearly depend on the factors, we first tried a non-linear tree-based model.
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(1)
+boost=gbm(log(price)~.,
+              data=ames_train,
+              distribution="gaussian",
+              n.trees=10000,
+              interaction.depth=4,
+              shrinkage = 0.01,
+              cv.folds = 5
+          )
+yhat.boost=exp(predict(boost,
+                          newdata=ames_test,
+                          n.trees=10000,
+                          type="response"))
+RMSE.boost =  sqrt( mean( (yhat.boost - ames_test$price)^2, na.rm = TRUE) )
+```
+
+The RMSE for the boosted model is $`r round(RMSE.boost)`$. 
+
+We can look at the variables importance from the boosted model. 
+
+```{r, echo=FALSE}
+kable(
+    head(summary(boost), 15)
+)
+```
+
+The top most important variables seem to include `Overall.Qual`, `Neighborhood`, and `TotalSq`. In particular the Neighborhood variable seems to indicate how important location is to home selling price. 
+
+#### 5.2 Variable Interactions
+
+We attempted to add variable interactions to the model, by adding multiplicative effects on the top 15 most important variables via boosting. However including interactions did not improve our RMSE scores. 
+
+We speculate that the reason is tree-based models don't need explicit interaction terms as much as linear models. Another reason might be that by limiting the number of iterations, our trees are not fully utlizing the added features. 
+
+
+#### 5.3 Variable Selection
+
+There are many factors in our original dataframe, even after the data-cleaning step. In addition many of the factor variables are very unbalanced. Because some terms may not be relevant, we tried Lasso as a way to select important variables. 
+
+```{r}
+sub_train = ames_train %>% select(-c(Utilities,price))
+y = ames_train %>% select(price) %>% as.matrix()
+train_sparse <- model.matrix(~.,sub_train)
+glmlas <- glmnet(train_sparse,log(y),alpha = 1)
+
+plot(glmlas,xvar = "lambda")
+```
+
+This plot shows how variables drop out as $\lambda$ increases. Next we implment 10-fold cross-validation to refine our model by choosing the best $\lambda$. 
+
+```{r}
+glmlas.cv <- cv.glmnet(train_sparse,log(y),nfolds=10,alpha = 1)
+
+sub_test = ames_test %>% select(-c(price,Utilities))
+test_sparse <- model.matrix(~., sub_test)
+
+yhat.glmlas <- exp(predict(glmlas, test_sparse, type="response", s= glmlas.cv$lambda.min))
+```
+
+```{r, echo=F}
+RMSE.glmlas =  sqrt( mean( (yhat.glmlas - ames_test$price)^2, na.rm = TRUE) )
+```
+
+The RMSE for Lasso is $`r RMSE.glmlas`$ which is higher than the boosting model. Therefore we continue with refining the boosting model. 
+
+#### 5.4 Final Boosting Model
+
+We will continue to optimize the boosting model. Because of a fear of overfitting, we use five-fold cross-validation to find the best number of trees. We also use a regularization term to further prevent overfitting. 
+
+We include all the variables in the boosting model to predict the price. We set the interaction depth of our boosting model as 4, as each tree in the model has four splits with a four-way interaction.
+
+We have the shrinkage parameter or learning rate of the boosting model as 0.01. It controls the rate of minimizing the loss function and shrink each tree in the model.
+
+```{r, message=FALSE}
+best.iter <- gbm.perf(boost, plot.it = FALSE, oobag.curve = FALSE, overlay = TRUE)
+```
+
+Using the gbm perf function, the estimated number of trees is `r best.iter`. Now we fit our final model and predict the new results.
+
+```{r}
+#check the performance of the model optimized after 5-fold cross validation
+set.seed(1)
+boost.cv=gbm(log(price)~.,
+              data=ames_train,
+              distribution="gaussian",
+              n.trees=best.iter,
+              interaction.depth=4,
+              shrinkage = 0.01)
+```
+
+```{r, echo=F}
+yhat.boost.cv=exp(predict(boost.cv,
+                          newdata=ames_test,
+                          n.trees=best.iter,
+                          type="response"))
+RMSE.boost.cv =  sqrt( mean( (yhat.boost.cv - ames_test$price)^2, na.rm = TRUE) )
+```
+
+The RMSE for the boosted model after cross validation is $`r round(RMSE.boost.cv)`$ which is better than our other models. 
+
+### 6. Results
+
+Finally we get results from our final boosting model. 
+
+**Coverage with Quantile Regression**
+
+```{r}
+boost.pi1=gbm(boost.cv,
+             distribution=list(name = "quantile", alpha = 0.025),
+             data = ames_test,
+             n.trees=best.iter)
+boost.pi2=gbm(boost.cv,
+             distribution=list(name = "quantile", alpha = 0.975),
+             data = ames_test,
+             n.trees=best.iter)
+
+
+# coverage
+cov.boost = mean((ames_test$price) >= exp(boost.pi1$fit) & ames_test$price <= exp(boost.pi2$fit))
+```
+
+We wanted to quantify uncertainty in our test predictions, so we used quantile regression. The coverage for the 95% confidence interval is `r cov.boost`. Finally,We made a dataframe of predictions and upper and lower CI on the testing and validation set. 
+
+```{r predict-model2, echo=FALSE}
+# replace model1 with model2
+predictions = as.data.frame(yhat.boost.cv)
+predictions$lwr = exp(boost.pi1$fit)
+predictions$upr = exp(boost.pi2$fit)
+predictions$PID = ames_test$PID
+colnames(predictions)[1] <- "fit"
+
+save(predictions, file="predict.Rdata")
+```
+
+```{r predict-model2-val, echo=FALSE}
+# replace model1 with model2
+yhat.boost.val = exp(predict(boost.cv,
+                          newdata=ames_validation,
+                          n.trees=best.iter,
+                          type="response"))
+predictions_val = as.data.frame(yhat.boost.val)
+predictions_val$PID = ames_validation$PID
+colnames(predictions_val)[1] <- "fit"
+
+save(predictions_val, file="predict-validation.Rdata")
+```
+
+#### 6.1 Model Diganostics
+
+We now look at model diganostics. 
+
+Here are the top variables chosen by our model.
+
+```{r, echo=FALSE}
+kable(head(summary(boost.cv,n.trees=best.iter, plotit = TRUE), 20))
+```
+
+We can see that the best number of trees chosen by cross-validation. As the number of trees increase, the model fits better until overfitting occurs. The green line is the out-of-sample error as predicted by cross-validation. 
+
+```{r, echo=FALSE}
+best.iter <- gbm.perf(boost, plot.it = TRUE, oobag.curve = FALSE, overlay = TRUE)
+```
+
+Finally we look at the residual plots. 
+
+```{r, echo=FALSE}
+yhat.train = predict(boost.cv, newdata=ames_train, n.trees=best.iter, type="response")
+plot(x=yhat.train, y = yhat.train-log(ames_train$price),
+     main = "Residual Plot of Boosting Model",
+     ylab = "residual",
+     xlab = "fitted value",
+     ylim = c(-0.5, 0.5))
+abline(h=0, col='blue')
+```
+
+The residuals seem to be centered around zero. Compared to our simple linear model, the residuals are much smaller. The model seems to fit more poorly for cheaper houses.  
+
+### 7. Analysis of House Valuation 
+
+We find the top 10 and bottom 10 best houses to buy according our model. 
+
+```{r}
+ames_test$price_diference = (yhat.boost.cv-ames_test$price)/ames_test$price
+under_value <-ames_test %>%top_n(10, wt=price_diference)%>%arrange(desc(price_diference))
+kable(select(under_value, Under_PID = PID, price))
+over_value <- ames_test %>%top_n(-10, price_diference)%>%arrange(price_diference)
+kable(select(over_value, Over_PID = PID, price))
+```
+
+We seperate the over and undervalued houses based on comparison between the given price and our predicted price of the houses and do further analysis. In the end we want to find variables that are related to house valuation, in order to provide reccomendation for the real estate agents on easier approach to more profitable houses. 
+
+```{r, message=FALSE, warning=FALSE}
+ames_test$should_buy = ifelse(ames_test$price_diference>0,1,0)
+ames_test$year.dif = ames_test$Year.Remod.Add - ames_test$Year.Built
+
+buy.rf = randomForest(select(ames_test, -should_buy,-price_diference, -PID), ames_test$should_buy)
+varImpPlot(buy.rf)
+kable(head(buy.rf$importance, 20))
+```
+
+These results suggest that comparing to predicting the price, predicting wether a house is undervalued(profitable) will depend more on exterior covering of the house, lot area and area of open porch, which are not impoartant variables in predicting the price. However, the neighborhood and the overall condition is always the most important predictors on both price and undervalue. Location does matter the most.
+
+```{r}
+buy1 = glm(should_buy ~ price + area+Year.Built+Year.Remod.Add+Overall.Qual + Neighborhood + TotalSq + Total.Bsmt.SF + Garage.Area + BsmtFin.SF.1 + X1st.Flr.SF + Overall.Cond + Garage.Type + Garage.Cars + Exterior.2nd+ Exterior.1st + Lot.Area+Fireplaces , data = ames_test)
+```
+
+Then, we fit a logistic regression model to predict whether a house is overpriced or underpriced and how the predictors affect the profitability of the house. Logistic regression result shows that houses with larger basement area, lot area, higher overal quality, more fireplaces and lower price tend to be more under-valued.
+
+```{r}
+buy.under <- ames_test %>% select(price, area,should_buy, Fireplaces, X1st.Flr.SF, Lot.Area) %>%
+  group_by(should_buy)%>%
+  summarise(mean(price),mean(area), mean(Fireplaces),mean(X1st.Flr.SF), mean(Lot.Area))
+kable(buy.under)
+```
+
+Generally, under-valued houses seem to have lower price, more fireplaces, larger first floor area and lot area. One thing interesting is that the number of fireplaces might be a good indicator for a undervalued house as 82% of the houses with 2 fireplaces are undervalued. 
+
+We will recommend a real estate agent to invest in a house with larger basement area, Lot area, higher overal quality, more fireplaces, exterior condition and lower price. These variables are more important in telling the profitability of a house.
+
+```{r}
+kable(table(ames_test$should_buy, ames_test$Fireplaces))
+```
+
+
+### 8. Conclusion
+
+The results of the models below, including our simple initial model and our final model based on boosting. The simple model was restricted to only numerical covariates. Because we wanted a parsimonious model, we used BIC to do variable selection. We tried two methods for a more complex model including Lasso and tree-based boosting. We settled on the boosting model as this gave very good results on the testing set. 
+
+```{r, echo=FALSE}
+kable(
+    data.frame(
+        models = c('Linear (BIC)', 'Boost1', 'Lasso', 'Boost-Final'),
+        RMSE = c(rmse.bic, RMSE.boost, RMSE.glmlas, RMSE.boost.cv),
+        cov = c(cov.bic, NA, NA, cov.boost)
+    )
+)
+```
+
+Our final model is a gradient boosted trees (gbm) model with log transformed price. By decreasing the learning rate(shrinkage term), we achieved good results with the original covariates. However the small shrinkage value does increase the time of computation significantly; it takes several minutes to fit our model compared to a few seconds for the linear model. 
+
+We set the maximum number of trees to be high so that our model could learn well. However, we were concerned about issues with overfitting. One of the models that we tried, but did not end up using was the Random Forest model. If the number of trees for Random Forest is too high, there is a big chance of overfitting. As part of our model testing, we used five-fold cross validation with gbm built in functions to find the best number of iterations for our boosting model. This significantly improved our results in terms of RMSE.
+
+One thing that surprised us is that scaling the covariates and manually adding interaction terms did not improve our model fit. We speculate that this is due the true model being significantly non-linear. The tree-based model may have discovered these non-linear interactions better than, for example, Lasso because trees are strongly non-linear.
+
+Finally, we produced predictions on the test and varlidation data. We used quantile regression to estimate confidence intervals on the test data, but could not do something similar for the validation. Our final model achieves an RMSE of lower than 14000. We used other modeling techniques to dervive insights on over or under valued houses. We found that variables such as number of fireplaces may have a surprising correlation with undervalued houses.  
+
+Some things that we could have done for the future is spend more time optimizing the hyperparameters of the boosting model. Another next step would be to look at other models that could help quantify varience like Bayesian methods. Finally, we acknowledge that while the model we chose gives accurate predictions, it is very hard to interpret. 
